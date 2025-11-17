@@ -1,0 +1,134 @@
+name: Aristotle Lean Proof Review
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+    paths:
+      - '**/*.lean'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  analyze:
+    name: Submit Lean files to Aristotle
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Aristotle CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install --no-cache-dir aristotlelib
+
+      - name: Install reviewdog
+        uses: reviewdog/action-setup@v1
+        with:
+          reviewdog_version: latest
+
+      - name: Collect Lean files containing sorry
+        id: gather
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          mapfile -t lean_files < <(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" -- '*.lean' || true)
+          if [[ ${#lean_files[@]} -eq 0 ]]; then
+            echo "files=" >> "$GITHUB_OUTPUT"
+            echo "No Lean files changed."
+            exit 0
+          fi
+
+          files_with_sorry=()
+          for file in "${lean_files[@]}"; do
+            if [[ -f "$file" ]] && grep -q "sorry" "$file"; then
+              files_with_sorry+=("$file")
+            fi
+          done
+
+          if [[ ${#files_with_sorry[@]} -eq 0 ]]; then
+            echo "files=" >> "$GITHUB_OUTPUT"
+            echo "No changed Lean files contain sorry."
+            exit 0
+          fi
+
+          printf '%s\n' "${files_with_sorry[@]}" > files_with_sorry.txt
+          {
+            printf 'files<<EOF\n'
+            printf '%s\n' "${files_with_sorry[@]}"
+            printf 'EOF\n'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Submit files to Aristotle
+        id: run_aristotle
+        if: steps.gather.outputs.files != ''
+        env:
+          ARISTOTLE_API_KEY: ${{ secrets.ARISTOTLE_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${ARISTOTLE_API_KEY:-}" ]]; then
+            echo "ARISTOTLE_API_KEY secret is required." >&2
+            exit 1
+          fi
+
+          diff_file="aristotle.diff"
+          : > "$diff_file"
+
+          while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            if [[ ! -f "$file" ]]; then
+              echo "Skipping missing file $file"
+              continue
+            fi
+
+            output_path="aristotle_output/$file"
+            mkdir -p "$(dirname "$output_path")"
+            echo "::group::Submitting $file to Aristotle"
+            aristotle prove-from-file "$file" --output-file "$output_path"
+            echo "::endgroup::"
+
+            tmp_diff="$(mktemp)"
+            if ! diff -u "$file" "$output_path" > "$tmp_diff"; then
+              status=$?
+              if [[ $status -eq 1 ]]; then
+                sed -E "s|^--- .*|--- a/$file|" "$tmp_diff" | \
+                sed -E "s|^\\+\\+\\+ .*|+++ b/$file|" >> "$diff_file"
+                printf '\n' >> "$diff_file"
+              else
+                cat "$tmp_diff"
+                rm -f "$tmp_diff"
+                exit $status
+              fi
+            fi
+            rm -f "$tmp_diff"
+          done < files_with_sorry.txt
+
+          if [[ -s "$diff_file" ]]; then
+            echo "changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Comment with Aristotle changes
+        if: steps.run_aristotle.outputs.changes == 'true'
+        env:
+          REVIEWDOG_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          reviewdog -f=diff -name="aristotle" -reporter=github-pr-review -filter-mode=added -fail-on-error=false < aristotle.diff
